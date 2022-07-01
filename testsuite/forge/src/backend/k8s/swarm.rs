@@ -18,36 +18,37 @@ use kube::{
     api::{Api, ListParams},
     client::Client as K8sClient,
 };
-use std::{collections::HashMap, convert::TryFrom, env, str, sync::Arc};
+use std::{collections::HashMap, convert::TryFrom, env, net::TcpListener, str, sync::Arc};
 use tokio::time::Duration;
 
-const JSON_RPC_PORT: u32 = 80;
-const REST_API_PORT: u32 = 80;
 const VALIDATOR_LB: &str = "validator-lb";
 const FULLNODES_LB: &str = "fullnode-lb";
+const LOCALHOST: &str = "127.0.0.1";
 
 pub struct K8sSwarm {
     validators: HashMap<PeerId, K8sNode>,
     fullnodes: HashMap<PeerId, K8sNode>,
     root_account: LocalAccount,
     kube_client: K8sClient,
-    helm_repo: String,
     versions: Arc<HashMap<Version, String>>,
     pub chain_id: ChainId,
+    kube_namespace: String,
 }
 
 impl K8sSwarm {
     pub async fn new(
         root_key: &[u8],
-        helm_repo: &str,
         image_tag: &str,
         base_image_tag: &str,
         init_image_tag: &str,
         era: &str,
+        kube_namespace: &str,
     ) -> Result<Self> {
         let kube_client = create_k8s_client().await;
-        let validators = get_validators(kube_client.clone(), init_image_tag).await?;
-        let fullnodes = get_fullnodes(kube_client.clone(), init_image_tag, era).await?;
+        let validators =
+            get_validators(kube_client.clone(), init_image_tag, kube_namespace).await?;
+        let fullnodes =
+            get_fullnodes(kube_client.clone(), init_image_tag, era, kube_namespace).await?;
 
         let client = validators.values().next().unwrap().rest_client();
         let key = load_root_key(root_key);
@@ -76,8 +77,8 @@ impl K8sSwarm {
             root_account,
             kube_client,
             chain_id: ChainId::new(4),
-            helm_repo: helm_repo.to_string(),
             versions: Arc::new(versions),
+            kube_namespace: kube_namespace.to_string(),
         })
     }
 
@@ -141,9 +142,9 @@ impl Swarm for K8sSwarm {
             .cloned()
             .ok_or_else(|| anyhow!("Invalid version: {:?}", version))?;
         set_validator_image_tag(
-            validator.name().to_string(),
+            validator.sts_name().to_string(),
             version,
-            self.helm_repo.clone(),
+            self.kube_namespace.clone(),
         )
     }
 
@@ -231,34 +232,45 @@ impl TryFrom<Service> for KubeService {
     }
 }
 
-async fn list_services(client: K8sClient) -> Result<Vec<KubeService>> {
-    let node_api: Api<Service> = Api::all(client);
+async fn list_services(client: K8sClient, kube_namespace: &str) -> Result<Vec<KubeService>> {
+    let node_api: Api<Service> = Api::namespaced(client, kube_namespace);
     let lp = ListParams::default();
     let services = node_api.list(&lp).await?.items;
     services.into_iter().map(KubeService::try_from).collect()
 }
 
+fn get_free_port() -> u16 {
+    // get a free port
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
 pub(crate) async fn get_validators(
     client: K8sClient,
     image_tag: &str,
+    kube_namespace: &str,
 ) -> Result<HashMap<PeerId, K8sNode>> {
-    let services = list_services(client).await?;
+    let services = list_services(client, kube_namespace).await?;
     let validators = services
         .into_iter()
         .filter(|s| s.name.contains(VALIDATOR_LB))
         .map(|s| {
+            // get a free port and port-forward to it
+            let port = get_free_port();
             let node_id = parse_node_id(&s.name).expect("error to parse node id");
+
             let node = K8sNode {
                 name: format!("aptos-node-{}-validator", node_id),
                 sts_name: parse_node_pod_basename(&s.name).unwrap(),
                 // TODO: fetch this from running node
                 peer_id: PeerId::random(),
                 node_id,
-                ip: s.host_ip.clone(),
-                port: JSON_RPC_PORT,
-                rest_api_port: REST_API_PORT,
+                ip: LOCALHOST.to_string(),
+                port: port as u32,
+                rest_api_port: port as u32,
                 dns: s.name,
                 version: Version::new(0, image_tag.to_string()),
+                namespace: kube_namespace.to_string(),
             };
             (node.peer_id(), node)
         })
@@ -279,24 +291,30 @@ pub(crate) async fn get_fullnodes(
     client: K8sClient,
     image_tag: &str,
     era: &str,
+    kube_namespace: &str,
 ) -> Result<HashMap<PeerId, K8sNode>> {
-    let services = list_services(client).await?;
+    let services = list_services(client, kube_namespace).await?;
     let fullnodes = services
         .into_iter()
         .filter(|s| s.name.contains(FULLNODES_LB))
         .map(|s| {
+            // get a free port and port-forward to it
+            let port = get_free_port();
+
             let node_id = parse_node_id(&s.name).expect("error to parse node id");
+
             let node = K8sNode {
                 name: format!("aptos-node-{}-fullnode", node_id),
                 sts_name: format!("{}-e{}", parse_node_pod_basename(&s.name).unwrap(), era),
                 // TODO: fetch this from running node
                 peer_id: PeerId::random(),
                 node_id,
-                ip: s.host_ip.clone(),
-                port: JSON_RPC_PORT,
-                rest_api_port: REST_API_PORT,
+                ip: LOCALHOST.to_string(),
+                port: port as u32,
+                rest_api_port: port as u32,
                 dns: s.name,
                 version: Version::new(0, image_tag.to_string()),
+                namespace: kube_namespace.to_string(),
             };
             (node.peer_id(), node)
         })
@@ -339,18 +357,24 @@ pub async fn nodes_healthcheck(nodes: Vec<&K8sNode>) -> Result<Vec<String>> {
 
     // TODO(rustielin): do all nodes healthchecks in parallel
     for node in nodes {
-        let node_name = node.name().to_string();
         // perform healthcheck with retry, returning unhealthy
+        let node_name = node.name().to_string();
         let check = aptos_retrier::retry_async(k8s_wait_nodes_strategy(), || {
             Box::pin(async move {
-                println!("Attempting health check: {:?}", node);
+                info!("Attempting port-forward: {:?}", node);
+                // XXX: assume this will succeed at least once
+                node.spawn_port_forward().map_err(|e| {
+                    info!("ERROR: kubectl port-forward @ {:?} {}", node, e);
+                    e
+                })?;
+                info!("Attempting health check: {:?}", node);
                 match node.rest_client().get_ledger_information().await {
                     Ok(_) => {
-                        println!("Node {} healthy", node.name());
+                        info!("Node {} healthy", node.name());
                         Ok(())
                     }
                     Err(x) => {
-                        debug!("K8s Node {} unhealthy: {}", node.name(), &x);
+                        info!("K8s Node {} unhealthy: {}", node.name(), &x);
                         Err(x)
                     }
                 }

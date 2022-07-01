@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{Factory, GenesisConfig, Result, Swarm, Version};
-use anyhow::bail;
+use anyhow::{bail, format_err};
 use rand::rngs::StdRng;
-use std::{convert::TryInto, num::NonZeroUsize};
+use std::{convert::TryInto, env, num::NonZeroUsize};
 
 mod cluster_helper;
 mod node;
@@ -18,9 +18,9 @@ use aptos_sdk::crypto::ed25519::ED25519_PRIVATE_KEY_LENGTH;
 
 pub struct K8sFactory {
     root_key: [u8; ED25519_PRIVATE_KEY_LENGTH],
-    helm_repo: String,
     image_tag: String,
     base_image_tag: String,
+    kube_namespace: String,
 }
 
 // These are test keys for forge ephemeral networks. Do not use these elsewhere!
@@ -30,15 +30,18 @@ const DEFAULT_ROOT_PRIV_KEY: &str =
     "E25708D90C72A53B400B27FC7602C4D546C7B7469FA6E12544F0EBFB2F16AE19";
 
 impl K8sFactory {
-    pub fn new(helm_repo: String, image_tag: String, base_image_tag: String) -> Result<K8sFactory> {
+    pub fn new(image_tag: String, base_image_tag: String) -> Result<K8sFactory> {
         let root_key: [u8; ED25519_PRIVATE_KEY_LENGTH] =
             hex::decode(DEFAULT_ROOT_PRIV_KEY)?.try_into().unwrap();
 
+        let kube_namespace = env::var("KUBE_NAMESPACE")
+            .map_err(|_| format_err!("Expected environment variable KUBE_NAMESPACE"))?;
+
         Ok(Self {
             root_key,
-            helm_repo,
             image_tag,
             base_image_tag,
+            kube_namespace,
         })
     }
 }
@@ -71,9 +74,8 @@ impl Factory for K8sFactory {
             None => None,
         };
 
-        uninstall_testnet_resources().await?;
         let era = reinstall_testnet_resources(
-            self.helm_repo.clone(),
+            self.kube_namespace.clone(),
             node_num.get(),
             format!("{}", init_version),
             format!("{}", genesis_version),
@@ -84,11 +86,11 @@ impl Factory for K8sFactory {
 
         let swarm = K8sSwarm::new(
             &self.root_key,
-            &self.helm_repo,
             &self.image_tag,
             &self.base_image_tag,
             format!("{}", init_version).as_str(),
             &era,
+            &self.kube_namespace,
         )
         .await
         .unwrap();
