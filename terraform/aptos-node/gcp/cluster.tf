@@ -6,7 +6,7 @@ resource "google_container_cluster" "aptos" {
 
   remove_default_node_pool = true
   initial_node_count       = 1
-  logging_service          = "none"
+  logging_service          = "logging.googleapis.com/kubernetes"
   monitoring_service       = "none"
 
   release_channel {
@@ -55,10 +55,6 @@ resource "google_container_cluster" "aptos" {
 
   pod_security_policy_config {
     enabled = true
-  }
-
-  logging_config {
-    enable_components = ["SYSTEM_COMPONENTS", "WORKLOADS"]
   }
 }
 
